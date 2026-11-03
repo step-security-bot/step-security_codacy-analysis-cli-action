@@ -1,0 +1,1 @@
+# codacy-analysis-cli-action
