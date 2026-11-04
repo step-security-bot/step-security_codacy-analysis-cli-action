@@ -1,0 +1,434 @@
+# action.yml
+name: "Codacy Analysis CLI"
+author: 'step-security'
+description: "Execute Codacy code analysis using your remote Codacy configuration"
+branding:
+  icon: "check"
+  color: "gray-dark"
+inputs:
+  verbose:
+    required: false
+    description: "Run with verbose output"
+  project-token:
+    required: false
+    description: "API project token to retrieve your remote Codacy configuration for the project being analyzed"
+  api-token:
+    required: false
+    description: "API account token to retrieve your remote Codacy configuration for the project being analyzed"
+  codacy-api-base-url:
+    required: false
+    description: "Codacy API URL to retrieve your remote Codacy configuration"
+  format:
+    required: false
+    description: "Output file format"
+  output:
+    required: false
+    description: "Path to a file to save the analysis results"
+  directory:
+    required: false
+    description: "Directory to analyze"
+  parallel:
+    required: false
+    description: "Number of tools to run in parallel"
+  max-tool-memory:
+    required: false
+    description: "Maximum allowed memory for running each tool (bytes)"
+  max-allowed-issues:
+    required: false
+    default: "2147483647"
+    description: "Maximum number of issues allowed for the analysis to succeed"
+  registry-address:
+    required: false
+    default: ""
+    description: "Alternative registry address (e.g. artprod.mycompany/)"
+  tool:
+    required: false
+    description: >-
+      Only run a specific tool or tool category (metrics, issues, duplication).
+      For the full list of tools, see https://docs.codacy.com/repositories-configure/codacy-configuration-file/#which-tools-can-be-configured-and-which-name-should-i-use
+  tool-timeout:
+    required: false
+    description: "Tool execution timeout (e.g. 15minutes, 1hour)"
+  upload:
+    required: false
+    description: "Upload analysis results to Codacy"
+  upload-batch-size:
+    required: false
+    description: "Maximum number of results in each batch to upload to Codacy"
+  fail-if-incomplete:
+    required: false
+    description: "Fail the analysis if any tool fails to run"
+  allow-network:
+    required: false
+    description: "Allow the tools to access the network"
+  force-file-permissions:
+    required: false
+    description: "Force files to be readable by changing the permissions before running the analysis"
+  gh-code-scanning-compat:
+    required: false
+    description: >-
+      Reduce issue severity by one level for non-security issues, for compatibility with GitHub's code scanning feature.
+      This option only has an effect when used with 'format: sarif'.
+  run-docker-tools:
+    required: false
+    default: "true"
+    description: >-
+      Run all dockerized tools supported by Codacy.
+      For the full list of tools, see https://docs.codacy.com/repositories-configure/codacy-configuration-file/#which-tools-can-be-configured-and-which-name-should-i-use
+  run-gosec:
+    required: false
+    description: "Run Gosec"
+  run-staticcheck:
+    required: false
+    description: "Run Staticcheck"
+  clang-tidy-output:
+    required: false
+    description: "Path to a file containing the output of Clang-Tidy."
+  faux-pas-output:
+    required: false
+    description: "Path to a file containing the output of Faux Pas."
+  skip-uncommitted-files-check:
+    required: false
+    description: "Skip validation of uncommitted changes"
+  skip-container-engine-check:
+    required: false
+    description: "Skip check for the presence of a known container engine before executing"
+runs:
+  using: "composite"
+  steps:
+    - name: Subscription check
+      env:
+        REPO_PRIVATE: ${{ github.event.repository.private }}
+      run: |
+        # validate subscription status
+        UPSTREAM="codacy/codacy-analysis-cli-action"
+        ACTION_REPO="${GITHUB_ACTION_REPOSITORY:-}"
+        DOCS_URL="https://docs.stepsecurity.io/actions/stepsecurity-maintained-actions"
+
+        echo ""
+        echo -e "\033[1;36mStepSecurity Maintained Action\033[0m"
+        echo "Secure drop-in replacement for $UPSTREAM"
+        if [ "$REPO_PRIVATE" = "false" ]; then
+          echo -e "\033[32m✓ Free for public repositories\033[0m"
+        fi
+        echo -e "\033[36mLearn more:\033[0m $DOCS_URL"
+        echo ""
+
+        if [ "$REPO_PRIVATE" != "false" ]; then
+          SERVER_URL="${GITHUB_SERVER_URL:-https://github.com}"
+
+          if [ "$SERVER_URL" != "https://github.com" ]; then
+            BODY=$(printf '{"action":"%s","ghes_server":"%s"}' "$ACTION_REPO" "$SERVER_URL")
+          else
+            BODY=$(printf '{"action":"%s"}' "$ACTION_REPO")
+          fi
+
+          API_URL="https://agent.api.stepsecurity.io/v1/github/$GITHUB_REPOSITORY/actions/maintained-actions-subscription"
+
+          RESPONSE=$(curl --max-time 3 -s -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$BODY" \
+            "$API_URL" -o /dev/null) && CURL_EXIT_CODE=0 || CURL_EXIT_CODE=$?
+
+          if [ $CURL_EXIT_CODE -ne 0 ]; then
+            echo "Timeout or API not reachable. Continuing to next step."
+          elif [ "$RESPONSE" = "403" ]; then
+            echo -e "::error::\033[1;31mThis action requires a StepSecurity subscription for private repositories.\033[0m"
+            echo -e "::error::\033[31mLearn how to enable a subscription: $DOCS_URL\033[0m"
+            exit 1
+          fi
+        fi
+      shell: bash
+
+    - name: "Set Global Variables"
+      shell: bash
+      env:
+        INPUT_CODACY_API_BASE_URL: ${{ inputs.codacy-api-base-url }}
+        INPUT_SKIP_CONTAINER_ENGINE_CHECK: ${{ inputs.skip-container-engine-check }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        CTX_SHA: ${{ github.sha }}
+      run: |
+        # Refuse values containing newlines/CR so they cannot inject extra variables into GITHUB_ENV
+        for v in "$INPUT_CODACY_API_BASE_URL" "$INPUT_SKIP_CONTAINER_ENGINE_CHECK"; do
+          case "$v" in
+            *$'\n'*|*$'\r'*) echo "::error::Invalid input: newlines are not allowed"; exit 1 ;;
+          esac
+        done
+
+        if [ -n "$INPUT_CODACY_API_BASE_URL" ]; then
+          echo "CODACY_BASE_URL_OR_DEFAULT=$INPUT_CODACY_API_BASE_URL" >> "$GITHUB_ENV"
+        else
+          echo "CODACY_BASE_URL_OR_DEFAULT=https://api.codacy.com" >> "$GITHUB_ENV"
+        fi
+        echo "OWNER_NAME=$(echo "$GITHUB_REPOSITORY" | cut -d '/' -f 1)" >> "$GITHUB_ENV"
+        echo "REPOSITORY_NAME=$(echo "$GITHUB_REPOSITORY" | cut -d '/' -f 2)" >> "$GITHUB_ENV"
+        echo "ORGANIZATION_PROVIDER=$(if [ "$GITHUB_SERVER_URL" == "https://github.com" ]; then echo "gh"; else echo "ghe"; fi)" >> "$GITHUB_ENV"
+        echo "COMMIT_SHA=$(if [ "$EVENT_NAME" == "pull_request" ]; then echo "$PR_HEAD_SHA"; else echo "$CTX_SHA"; fi)" >> "$GITHUB_ENV"
+        if [ -n "$INPUT_SKIP_CONTAINER_ENGINE_CHECK" ]; then
+          echo "SKIP_CONTAINER_ENGINE_CHECK=$INPUT_SKIP_CONTAINER_ENGINE_CHECK" >> "$GITHUB_ENV"
+        fi
+
+    - name: "Validate authentication inputs"
+      shell: bash
+      env:
+        INPUT_API_TOKEN: ${{ inputs.api-token }}
+        INPUT_PROJECT_TOKEN: ${{ inputs.project-token }}
+        INPUT_UPLOAD: ${{ inputs.upload }}
+      run: |
+        # Tokens are intentionally NOT persisted to GITHUB_ENV; each step that needs them receives them via its own env.
+        if [ -z "$INPUT_API_TOKEN" ] && [ -z "$INPUT_PROJECT_TOKEN" ] && [ "$INPUT_UPLOAD" == "true" ]; then
+          echo "At least one authentication method is required to upload results."
+          exit 1
+        fi
+
+    - name: "Run GoSec"
+      shell: bash
+      env:
+        INPUT_RUN_GOSEC: ${{ inputs.run-gosec }}
+        INPUT_UPLOAD: ${{ inputs.upload }}
+        INPUT_API_TOKEN: ${{ inputs.api-token }}
+        INPUT_PROJECT_TOKEN: ${{ inputs.project-token }}
+      run: |
+        CURL_CODACY_AUTH_AUTHENTICATION=""
+        if [ -n "$INPUT_API_TOKEN" ]; then
+          CURL_CODACY_AUTH_AUTHENTICATION="api-token: $INPUT_API_TOKEN"
+        elif [ -n "$INPUT_PROJECT_TOKEN" ]; then
+          CURL_CODACY_AUTH_AUTHENTICATION="project-token: $INPUT_PROJECT_TOKEN"
+        fi
+
+        set -eux
+
+        if [ "$INPUT_RUN_GOSEC" == "true" ]; then
+          cd /tmp
+          # install.sh pinned to the commit of tag v2.15.0 (a459eb0ba387d9bd083d5c2e2354dbeef2465038)
+          curl -sfL https://raw.githubusercontent.com/securego/gosec/a459eb0ba387d9bd083d5c2e2354dbeef2465038/install.sh | sh -s v2.15.0
+          chmod +x ./bin/gosec
+          CODACY_GOSEC_VERSION=$(curl -SL "https://artifacts.codacy.com/bin/codacy-gosec/latest" -o-)
+          curl -fsSL "https://artifacts.codacy.com/bin/codacy-gosec/$CODACY_GOSEC_VERSION/codacy-gosec-$CODACY_GOSEC_VERSION" -o /tmp/codacy-gosec
+          chmod +x /tmp/codacy-gosec
+          cd -
+
+          /tmp/bin/gosec -no-fail -fmt json -log /tmp/log.txt ./... > /tmp/gosec-out.json
+          /tmp/codacy-gosec < /tmp/gosec-out.json > /tmp/codacy-out.json
+          if [ "$INPUT_UPLOAD" == "true" ]; then
+            curl -XPOST -L -H "$CURL_CODACY_AUTH_AUTHENTICATION" \
+              -H "Content-type: application/json" --data-binary @/tmp/codacy-out.json \
+              "${CODACY_BASE_URL_OR_DEFAULT}/2.0/$ORGANIZATION_PROVIDER/$OWNER_NAME/$REPOSITORY_NAME/commit/$COMMIT_SHA/issuesRemoteResults"
+          else
+            cat /tmp/codacy-out.json
+          fi
+        else
+          echo "Skipping GoSec"
+        fi
+    - name: set-up go
+      if: ${{ inputs.run-staticcheck == 'true' }}
+      uses: actions/setup-go@v7
+      with:
+        go-version: 1.20.2
+    - name: "Run StaticCheck"
+      shell: bash
+      env:
+        INPUT_RUN_STATICCHECK: ${{ inputs.run-staticcheck }}
+        INPUT_UPLOAD: ${{ inputs.upload }}
+        INPUT_API_TOKEN: ${{ inputs.api-token }}
+        INPUT_PROJECT_TOKEN: ${{ inputs.project-token }}
+      run: |
+        CURL_CODACY_AUTH_AUTHENTICATION=""
+        if [ -n "$INPUT_API_TOKEN" ]; then
+          CURL_CODACY_AUTH_AUTHENTICATION="api-token: $INPUT_API_TOKEN"
+        elif [ -n "$INPUT_PROJECT_TOKEN" ]; then
+          CURL_CODACY_AUTH_AUTHENTICATION="project-token: $INPUT_PROJECT_TOKEN"
+        fi
+
+        set -eux
+
+        if [ "$INPUT_RUN_STATICCHECK" == "true" ]; then
+          cd /tmp
+          go install honnef.co/go/tools/cmd/staticcheck@2023.1.6      
+          chmod +x /home/runner/go/bin/staticcheck
+          CODACY_STATICCHECK_VERSION=$(curl -SL "https://artifacts.codacy.com/bin/codacy-staticcheck/latest" -o-)
+          curl -fsSL "https://artifacts.codacy.com/bin/codacy-staticcheck/$CODACY_STATICCHECK_VERSION/codacy-staticcheck-$CODACY_STATICCHECK_VERSION" -o /tmp/codacy-staticcheck
+          chmod +x /tmp/codacy-staticcheck
+          cd -
+
+          find . -type f -name go.mod -exec bash -c 'cd $(dirname $1); cp $1 $1.codacy.bak; PKGS=$(go list ./...); /home/runner/go/bin/staticcheck -f json $PKGS; mv $1.codacy.bak $1' _ {} \; > /tmp/staticcheck-out.json
+          /tmp/codacy-staticcheck < /tmp/staticcheck-out.json > /tmp/codacy-out.json
+          if [ "$INPUT_UPLOAD" == "true" ]; then
+            curl -XPOST -L -H "$CURL_CODACY_AUTH_AUTHENTICATION" \
+              -H "Content-type: application/json" --data-binary @/tmp/codacy-out.json \
+              "${CODACY_BASE_URL_OR_DEFAULT}/2.0/$ORGANIZATION_PROVIDER/$OWNER_NAME/$REPOSITORY_NAME/commit/$COMMIT_SHA/issuesRemoteResults"
+          else
+            cat /tmp/codacy-out.json
+          fi
+        else
+          echo "Skipping StaticCheck"
+        fi
+
+    - name: "Parse and Push Clang Tidy results"
+      shell: bash
+      env:
+        INPUT_CLANG_TIDY_OUTPUT: ${{ inputs.clang-tidy-output }}
+        INPUT_UPLOAD: ${{ inputs.upload }}
+        INPUT_API_TOKEN: ${{ inputs.api-token }}
+        INPUT_PROJECT_TOKEN: ${{ inputs.project-token }}
+      run: |
+        CURL_CODACY_AUTH_AUTHENTICATION=""
+        if [ -n "$INPUT_API_TOKEN" ]; then
+          CURL_CODACY_AUTH_AUTHENTICATION="api-token: $INPUT_API_TOKEN"
+        elif [ -n "$INPUT_PROJECT_TOKEN" ]; then
+          CURL_CODACY_AUTH_AUTHENTICATION="project-token: $INPUT_PROJECT_TOKEN"
+        fi
+
+        set -eux
+
+        if [ -n "$INPUT_CLANG_TIDY_OUTPUT" ]; then
+          cd /tmp
+          CODACY_CLANG_TIDY_VERSION=$(curl -SL "https://artifacts.codacy.com/bin/codacy-clang-tidy/latest" -o-)
+          curl -fsSL "https://artifacts.codacy.com/bin/codacy-clang-tidy/$CODACY_CLANG_TIDY_VERSION/codacy-clang-tidy-linux-$CODACY_CLANG_TIDY_VERSION" -o /tmp/codacy-clang-tidy
+          chmod +x /tmp/codacy-clang-tidy
+          cd -
+
+          /tmp/codacy-clang-tidy < "$INPUT_CLANG_TIDY_OUTPUT" > /tmp/codacy-out.json
+          if [ "$INPUT_UPLOAD" == "true" ]; then
+            curl -XPOST -L -H "$CURL_CODACY_AUTH_AUTHENTICATION" \
+              -H "Content-type: application/json" --data-binary @/tmp/codacy-out.json \
+              "${CODACY_BASE_URL_OR_DEFAULT}/2.0/$ORGANIZATION_PROVIDER/$OWNER_NAME/$REPOSITORY_NAME/commit/$COMMIT_SHA/issuesRemoteResults"
+          else
+            cat /tmp/codacy-out.json
+          fi
+        else
+          echo "Skipping Clang Tidy"
+        fi
+
+    - name: "Parse and Push Faux Pas results"
+      shell: bash
+      env:
+        INPUT_FAUX_PAS_OUTPUT: ${{ inputs.faux-pas-output }}
+        INPUT_UPLOAD: ${{ inputs.upload }}
+        INPUT_API_TOKEN: ${{ inputs.api-token }}
+        INPUT_PROJECT_TOKEN: ${{ inputs.project-token }}
+      run: |
+        CURL_CODACY_AUTH_AUTHENTICATION=""
+        if [ -n "$INPUT_API_TOKEN" ]; then
+          CURL_CODACY_AUTH_AUTHENTICATION="api-token: $INPUT_API_TOKEN"
+        elif [ -n "$INPUT_PROJECT_TOKEN" ]; then
+          CURL_CODACY_AUTH_AUTHENTICATION="project-token: $INPUT_PROJECT_TOKEN"
+        fi
+
+        set -eux
+
+        if [ -n "$INPUT_FAUX_PAS_OUTPUT" ]; then
+          cd /tmp
+          CODACY_FAUX_PAS_VERSION=$(curl -SL "https://artifacts.codacy.com/bin/codacy-faux-pas/latest" -o-)
+          curl -fsSL "https://artifacts.codacy.com/bin/codacy-faux-pas/$CODACY_FAUX_PAS_VERSION/codacy-faux-pas-$CODACY_FAUX_PAS_VERSION" -o /tmp/codacy-faux-pas
+          chmod +x /tmp/codacy-faux-pas
+          cd -
+
+          /tmp/codacy-faux-pas < "$INPUT_FAUX_PAS_OUTPUT" > /tmp/codacy-out.json
+          if [ "$INPUT_UPLOAD" == "true" ]; then
+            curl -XPOST -L -H "$CURL_CODACY_AUTH_AUTHENTICATION" \
+              -H "Content-type: application/json" --data-binary @/tmp/codacy-out.json \
+              "${CODACY_BASE_URL_OR_DEFAULT}/2.0/$ORGANIZATION_PROVIDER/$OWNER_NAME/$REPOSITORY_NAME/commit/$COMMIT_SHA/issuesRemoteResults"
+          else
+            cat /tmp/codacy-out.json
+          fi
+        else
+          echo "Skipping Faux Pas"
+        fi
+
+    - name: "Set Codacy CLI version"
+      shell: bash
+      run: echo "CODACY_ANALYSIS_CLI_VERSION=7.10.4" >> $GITHUB_ENV
+    - name: "Set script path environment variable"
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: echo "CLI_SCRIPT_PATH=$ACTION_PATH/codacy-analysis-cli.sh" >> "$GITHUB_ENV"
+    - name: "Download Codacy CLI script"
+      shell: bash
+      run: wget -O - "https://raw.githubusercontent.com/codacy/codacy-analysis-cli/$CODACY_ANALYSIS_CLI_VERSION/bin/codacy-analysis-cli.sh" > "$CLI_SCRIPT_PATH"
+    - name: "Change Codacy CLI script permissions"
+      shell: bash
+      run: chmod +x "$CLI_SCRIPT_PATH"
+    - name: "Run Codacy CLI"
+      shell: bash
+      env:
+        INPUT_VERBOSE: ${{ inputs.verbose }}
+        INPUT_PROJECT_TOKEN: ${{ inputs.project-token }}
+        INPUT_API_TOKEN: ${{ inputs.api-token }}
+        INPUT_CODACY_API_BASE_URL: ${{ inputs.codacy-api-base-url }}
+        INPUT_FORMAT: ${{ inputs.format }}
+        INPUT_OUTPUT: ${{ inputs.output }}
+        INPUT_DIRECTORY: ${{ inputs.directory }}
+        INPUT_PARALLEL: ${{ inputs.parallel }}
+        INPUT_MAX_TOOL_MEMORY: ${{ inputs.max-tool-memory }}
+        INPUT_MAX_ALLOWED_ISSUES: ${{ inputs.max-allowed-issues }}
+        INPUT_TOOL: ${{ inputs.tool }}
+        INPUT_TOOL_TIMEOUT: ${{ inputs.tool-timeout }}
+        INPUT_SKIP_UNCOMMITTED_FILES_CHECK: ${{ inputs.skip-uncommitted-files-check }}
+        INPUT_UPLOAD: ${{ inputs.upload }}
+        INPUT_UPLOAD_BATCH_SIZE: ${{ inputs.upload-batch-size }}
+        INPUT_FAIL_IF_INCOMPLETE: ${{ inputs.fail-if-incomplete }}
+        INPUT_ALLOW_NETWORK: ${{ inputs.allow-network }}
+        INPUT_FORCE_FILE_PERMISSIONS: ${{ inputs.force-file-permissions }}
+        INPUT_GH_CODE_SCANNING_COMPAT: ${{ inputs.gh-code-scanning-compat }}
+        INPUT_REGISTRY_ADDRESS: ${{ inputs.registry-address }}
+        INPUT_RUN_DOCKER_TOOLS: ${{ inputs.run-docker-tools }}
+      run: |
+        if [ -n "$INPUT_REGISTRY_ADDRESS" ]; then
+          export REGISTRY_ADDRESS="$INPUT_REGISTRY_ADDRESS"
+        fi
+        if [ "$INPUT_RUN_DOCKER_TOOLS" == "true" ]; then
+          args=(analyze --skip-commit-uuid-validation --commit-uuid "$COMMIT_SHA")
+          if [ "$INPUT_VERBOSE" == "true" ]; then args+=(--verbose); fi
+          if [ -n "$INPUT_PROJECT_TOKEN" ]; then args+=(--project-token "$INPUT_PROJECT_TOKEN"); fi
+          if [ -n "$INPUT_API_TOKEN" ]; then
+            args+=(--api-token "$INPUT_API_TOKEN" --username "$OWNER_NAME" --project "$REPOSITORY_NAME" --provider "$ORGANIZATION_PROVIDER")
+          fi
+          if [ -n "$INPUT_CODACY_API_BASE_URL" ]; then args+=(--codacy-api-base-url "$INPUT_CODACY_API_BASE_URL"); fi
+          if [ -n "$INPUT_FORMAT" ]; then args+=(--format "$INPUT_FORMAT"); fi
+          if [ -n "$INPUT_OUTPUT" ]; then args+=(--output "$INPUT_OUTPUT"); fi
+          if [ -n "$INPUT_DIRECTORY" ]; then args+=(--directory "$INPUT_DIRECTORY"); fi
+          if [ -n "$INPUT_PARALLEL" ]; then args+=(--parallel "$INPUT_PARALLEL"); fi
+          if [ -n "$INPUT_MAX_TOOL_MEMORY" ]; then args+=(--max-tool-memory "$INPUT_MAX_TOOL_MEMORY"); fi
+          if [ -n "$INPUT_MAX_ALLOWED_ISSUES" ]; then args+=(--max-allowed-issues "$INPUT_MAX_ALLOWED_ISSUES"); fi
+          if [ -n "$INPUT_TOOL" ]; then args+=(--tool "$INPUT_TOOL"); fi
+          if [ -n "$INPUT_TOOL_TIMEOUT" ]; then args+=(--tool-timeout "$INPUT_TOOL_TIMEOUT"); fi
+          if [ "$INPUT_SKIP_UNCOMMITTED_FILES_CHECK" == "true" ]; then args+=(--skip-uncommitted-files-check); fi
+          if [ "$INPUT_UPLOAD" == "true" ]; then args+=(--upload); fi
+          if [ -n "$INPUT_UPLOAD_BATCH_SIZE" ]; then args+=(--upload-batch-size "$INPUT_UPLOAD_BATCH_SIZE"); fi
+          if [ "$INPUT_FAIL_IF_INCOMPLETE" == "true" ]; then args+=(--fail-if-incomplete); fi
+          if [ "$INPUT_ALLOW_NETWORK" == "true" ]; then args+=(--allow-network); fi
+          if [ "$INPUT_FORCE_FILE_PERMISSIONS" == "true" ]; then args+=(--force-file-permissions); fi
+          if [ "$INPUT_GH_CODE_SCANNING_COMPAT" == "true" ]; then args+=(--gh-code-scanning-compat); fi
+          if [ -n "$INPUT_REGISTRY_ADDRESS" ]; then args+=(--registry-address "$INPUT_REGISTRY_ADDRESS"); fi
+
+          "$CLI_SCRIPT_PATH" "${args[@]}"
+        else
+          echo "Skipping docker tools"
+        fi
+
+    - name: "Let Codacy know it can start processing the analysis results"
+      shell: bash
+      env:
+        INPUT_UPLOAD: ${{ inputs.upload }}
+        INPUT_API_TOKEN: ${{ inputs.api-token }}
+        INPUT_PROJECT_TOKEN: ${{ inputs.project-token }}
+      run: |
+        CURL_CODACY_AUTH_AUTHENTICATION=""
+        if [ -n "$INPUT_API_TOKEN" ]; then
+          CURL_CODACY_AUTH_AUTHENTICATION="api-token: $INPUT_API_TOKEN"
+        elif [ -n "$INPUT_PROJECT_TOKEN" ]; then
+          CURL_CODACY_AUTH_AUTHENTICATION="project-token: $INPUT_PROJECT_TOKEN"
+        fi
+
+        if [ "$INPUT_UPLOAD" == "true" ]; then
+          echo "Uploading results for $ORGANIZATION_PROVIDER/$OWNER_NAME/$REPOSITORY_NAME commit $COMMIT_SHA"
+          curl -XPOST -L -H "$CURL_CODACY_AUTH_AUTHENTICATION" \
+            -H "Content-type: application/json" \
+            "${CODACY_BASE_URL_OR_DEFAULT}/2.0/$ORGANIZATION_PROVIDER/$OWNER_NAME/$REPOSITORY_NAME/commit/$COMMIT_SHA/resultsFinal"
+        else
+          echo "Skipping results upload"
+        fi
